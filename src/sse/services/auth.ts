@@ -26,7 +26,6 @@ import {
   getQuotaWindowStatus,
   isQuotaExhaustedForRequest,
 } from "@/domain/quotaCache";
-import { getQuotaScopeLabelForProvider } from "@omniroute/open-sse/services/antigravityQuotaFamily.ts";
 import { getCreditsMode } from "@omniroute/open-sse/services/antigravityCredits.ts";
 import {
   isAccountUnavailable,
@@ -1191,7 +1190,6 @@ export async function getProviderCredentials(
     }
 
     let modelLockedCount = 0;
-    let familyLockedCount = 0;
     const connectionFilterStatus = new Map<string, string>();
     // Filter out unavailable accounts and excluded connection
     const availableConnections = connections.filter((c) => {
@@ -1219,14 +1217,7 @@ export async function getProviderCredentials(
         // Per-model lockout: if this specific model/family is locked on this connection, skip it
         if (requestedModel && isModelLocked(provider, c.id, requestedModel)) {
           connectionFilterStatus.set(c.id, "modelLocked");
-          if (
-            provider === "antigravity" &&
-            getQuotaScopeLabelForProvider(provider, requestedModel) === "family"
-          ) {
-            familyLockedCount += 1;
-          } else {
-            modelLockedCount += 1;
-          }
+          modelLockedCount += 1;
           return false;
         }
       }
@@ -1241,7 +1232,7 @@ export async function getProviderCredentials(
     if (provider === "antigravity") {
       log.info(
         "AUTH",
-        `${provider} selection candidates model=${requestedModel || "none"}: active=${activeConnectionsCount}, excluded=${excludedConnectionIds.size}, modelLocked=${modelLockedCount}, familyLocked=${familyLockedCount}, eligible=${availableConnections.length}`
+        `${provider} selection candidates model=${requestedModel || "none"}: active=${activeConnectionsCount}, excluded=${excludedConnectionIds.size}, modelLocked=${modelLockedCount}, eligible=${availableConnections.length}`
       );
     }
     connections.forEach((c) => {
@@ -2041,12 +2032,10 @@ export async function markAccountUnavailable(
         return { shouldFallback: true, cooldownMs: 0 };
       }
 
-      const usesExactAntigravityLock = provider === "antigravity";
-      const quotaScope = usesExactAntigravityLock
-        ? "model"
-        : getQuotaScopeLabelForProvider(provider, model);
+      // Antigravity's initial 429 backoff is still useful, but its lock key is
+      // exact-model scoped by accountFallback's canonical quota scope.
       const antigravityFamilyInferredBaseCooldownMs =
-        !usesExactAntigravityLock && provider === "antigravity" && quotaScope === "family" && status === 429
+        provider === "antigravity" && status === 429
           ? ANTIGRAVITY_FAMILY_INFERRED_BASE_COOLDOWN_MS
           : null;
       const lockout = recordModelLockoutFailure(
