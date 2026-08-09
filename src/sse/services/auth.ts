@@ -2056,6 +2056,7 @@ export async function markAccountUnavailable(
 
       // Antigravity's initial 429 backoff is still useful, but its lock key is
       // exact-model scoped by accountFallback's canonical quota scope.
+      const usesExactAntigravityLock = provider === "antigravity";
       const antigravityFamilyInferredBaseCooldownMs =
         provider === "antigravity" && status === 429
           ? ANTIGRAVITY_FAMILY_INFERRED_BASE_COOLDOWN_MS

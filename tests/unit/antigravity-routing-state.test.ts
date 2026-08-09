@@ -34,7 +34,7 @@ test("lease key is connection plus canonical exact model", () => {
   );
 });
 
-test("release is fenced and expiration restores availability", () => {
+test("release is fenced and explicit release restores availability", () => {
   const acquired = state.tryAcquireAntigravityLease({
     connectionId: "account-a",
     requestedModel: "gemini-3.5-flash-high",
@@ -52,7 +52,7 @@ test("release is fenced and expiration restores availability", () => {
       requestedModel: "gemini-3-flash-agent",
       now: 1_001,
     }),
-    { available: false, earliestExpiryMs: 1_010 }
+    { available: false, earliestExpiryMs: acquired.lease.expiresAtMs }
   );
   assert.equal(state.releaseAntigravityLease(acquired.lease.id), true);
   assert.deepEqual(
