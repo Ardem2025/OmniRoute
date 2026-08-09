@@ -79,6 +79,12 @@ import { isNoAuthProviderBlockedBySettings } from "./noAuthProviderSettings";
 import { resolveAccountProxiesFromRegistry } from "./noAuthProxyResolution";
 import { getNoAuthHydrationProviderIds } from "./noAuthProviderSiblings";
 import { getResource404Bypass } from "./requestResourceHealth";
+import {
+  canonicalizeAntigravityExactModel,
+  tryAcquireAntigravityLease,
+  releaseAntigravityLease,
+  type AntigravityLease,
+} from "./antigravityRoutingState";
 import * as log from "../utils/logger";
 import { fisherYatesShuffle, getNextFromDeckSync } from "@/shared/utils/shuffleDeck";
 import { readHeaderValue, type AuthRequestHeaders } from "./headerReader.ts";
@@ -102,6 +108,10 @@ interface CredentialSelectionOptions {
   excludeConnectionIds?: string[] | null;
   sessionKey?: string | null;
   sessionAffinityTtlMs?: number | null;
+  /** Internal process-local routing lease; only final chat dispatch opts in. */
+  routingRequestId?: string | null;
+  routingDeadlineMs?: number | null;
+  reserveAntigravityLease?: boolean;
 }
 
 interface CooldownInspectionState {
@@ -1641,11 +1651,21 @@ export async function getProviderCredentials(
       connection = orderedConnections[0];
     }
 
+    let routingLease: AntigravityLease | undefined;
+    if (provider === "antigravity" && connection && options.reserveAntigravityLease === true) {
+      const acquired = tryAcquireAntigravityLease({
+        connectionId: connection.id,
+        requestedModel,
+        requestId: options.routingRequestId,
+        deadlineMs: options.routingDeadlineMs,
+      });
+      if (acquired.kind === "busy") {
+        return { leaseUnavailable: true as const, selectedConnectionId: connection.id, earliestLeaseExpiryMs: acquired.earliestExpiryMs };
+      }
+      routingLease = acquired.lease;
+    }
     if (provider === "antigravity" && connection) {
-      log.info(
-        "AUTH",
-        `${provider} selected account=${connection.id?.slice(0, 8)}... eligible=${orderedConnections.length} excluded=${excludedConnectionIds.size}`
-      );
+      log.info("AUTH", `${provider} selected account=${connection.id?.slice(0, 8)}... eligible=${orderedConnections.length} excluded=${excludedConnectionIds.size}`);
     }
 
     const apiKeyHealth = connection.providerSpecificData?.apiKeyHealth as
@@ -1689,6 +1709,7 @@ export async function getProviderCredentials(
       // getProviderCredentialsWithQuotaPreflight can see them. Without this,
       // user-set cutoffs would silently never enforce.
       quotaWindowThresholds: connection.quotaWindowThresholds ?? null,
+      routing: routingLease ? { provider: "antigravity" as const, connectionId: connection.id, exactModel: canonicalizeAntigravityExactModel(requestedModel), leaseId: routingLease.id } : undefined,
     };
   } finally {
     selectionLock.release();
@@ -1854,6 +1875,7 @@ export async function getProviderCredentialsWithQuotaPreflight(
     if (preflight.proceed) {
       return credentials;
     }
+    releaseAntigravityLease((credentials as { routing?: { leaseId?: string } }).routing?.leaseId);
 
     const unavailableUntil = await markQuotaPreflightAccountUnavailable(
       provider,
