@@ -2,6 +2,8 @@ import { BaseGuardrail, type GuardrailContext, type GuardrailResult } from "./ba
 import { processPII } from "@/shared/utils/inputSanitizer";
 import { sanitizePII, sanitizePIIResponse } from "@/lib/piiSanitizer";
 
+import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+
 type PiiDetection = {
   count: number;
   type: string;
@@ -10,9 +12,9 @@ type PiiDetection = {
 type JsonRecord = Record<string, unknown>;
 
 function isRequestPiiMaskingEnabled() {
-  return (
-    process.env.PII_REDACTION_ENABLED === "true" && process.env.INPUT_SANITIZER_MODE === "redact"
-  );
+  // Request PII redaction is controlled by PII_REDACTION_ENABLED feature flag (DB > env > default).
+  // INPUT_SANITIZER_MODE only governs prompt-injection policy (warn/block/log).
+  return isFeatureFlagEnabled("PII_REDACTION_ENABLED");
 }
 
 function sanitizeStringValue(text: string) {
@@ -55,11 +57,18 @@ function applyToContentValue(
           modified ||= result.modified;
           record.text = result.text;
         }
-        if (typeof record.content === "string") {
-          const result = sanitizeStringValue(record.content);
-          detections.push(...result.detections);
+        // Recurse rather than only masking a string `content`. A tool_result
+        // block carries its payload as an array of parts, which is what every
+        // agentic client sends back, and the string-only test walked straight
+        // past it: the outer text block was redacted while the tool output next
+        // to it reached the provider intact. This is the same call
+        // sanitizeMessageLikeList already makes one level up, so the two agree
+        // on how deep masking goes. The payload is a JSON round-trip, so it is
+        // acyclic and the recursion is bounded by its nesting.
+        if ("content" in record) {
+          const result = applyToContentValue(record.content, detections);
           modified ||= result.modified;
-          record.content = result.text;
+          record.content = result.value;
         }
         return record;
       }
@@ -84,6 +93,13 @@ function cloneAndMaskRequestPayload(payload: unknown) {
   const sanitizeMessageLikeList = (list: unknown) => {
     if (!Array.isArray(list)) return list;
     return list.map((entry) => {
+      // Responses API can pass plain strings in input[]
+      if (typeof entry === "string") {
+        const result = sanitizeStringValue(entry);
+        detections.push(...result.detections);
+        modified ||= result.modified;
+        return result.text;
+      }
       if (!entry || typeof entry !== "object") return entry;
       const record = { ...(entry as JsonRecord) };
       if ("content" in record) {
@@ -116,6 +132,20 @@ function cloneAndMaskRequestPayload(payload: unknown) {
 
   if (Array.isArray(clonedPayload.input)) {
     clonedPayload.input = sanitizeMessageLikeList(clonedPayload.input);
+  } else if (typeof clonedPayload.input === "string") {
+    const result = sanitizeStringValue(clonedPayload.input);
+    detections.push(...result.detections);
+    modified ||= result.modified;
+    clonedPayload.input = result.text;
+  }
+
+  if (typeof clonedPayload.prompt === "string") {
+    const result = sanitizeStringValue(clonedPayload.prompt);
+    detections.push(...result.detections);
+    modified ||= result.modified;
+    clonedPayload.prompt = result.text;
+  } else if (Array.isArray(clonedPayload.prompt)) {
+    clonedPayload.prompt = sanitizeMessageLikeList(clonedPayload.prompt);
   }
 
   return {

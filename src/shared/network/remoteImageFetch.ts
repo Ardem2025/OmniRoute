@@ -2,11 +2,19 @@ import { isIP } from "node:net";
 import dns from "node:dns";
 import {
   type OutboundUrlGuardMode,
-  getProviderOutboundGuard,
   isPrivateHost,
+  parseAndValidateNonMetadataUrl,
   parseAndValidatePublicUrl,
   parseOutboundUrl,
 } from "@/shared/network/outboundUrlGuard";
+import { getProviderOutboundGuard } from "@/shared/network/outboundUrlGuardPolicy";
+// #12569: `createPinnedFetch` now lives in the shared `dnsPinnedFetch.ts` module so the
+// webhook outbound-URL guard can reuse the exact same connection-pinning mechanism instead of
+// duplicating it. Re-exported here for backward compatibility with existing importers of
+// `@/shared/network/remoteImageFetch`.
+import { createPinnedFetch } from "@/shared/network/dnsPinnedFetch";
+
+export { createPinnedFetch };
 
 const DEFAULT_MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024;
 const DEFAULT_MAX_REDIRECTS = 3;
@@ -22,7 +30,11 @@ export type RemoteImageLookup = (
 ) => Promise<Array<{ address: string; family: number }>>;
 
 export interface RemoteImageFetchOptions {
+  /** Require HTTPS for the initial URL and every redirect hop. Default false for compatibility. */
+  enforceHttps?: boolean;
   fetchImpl?: typeof fetch;
+  /** Pin the network connection to a DNS answer that passed validation. */
+  pinDns?: boolean;
   guard?: OutboundUrlGuardMode;
   maxBytes?: number;
   maxRedirects?: number;
@@ -36,42 +48,43 @@ export interface RemoteImageFetchOptions {
 }
 
 export interface RemoteImageFetchResult {
-  buffer: Buffer;
+  buffer: Buffer<ArrayBuffer>;
   contentType: string;
   url: string;
 }
 
+/** Generic aliases for non-image callers that need the same SSRF/bounds policy. */
+export type RemoteMediaFetchOptions = RemoteImageFetchOptions;
+export type RemoteMediaFetchResult = RemoteImageFetchResult;
+
 function validateRemoteImageUrl(input: string | URL, guard: OutboundUrlGuardMode) {
-  return guard === "public-only" ? parseAndValidatePublicUrl(input) : parseOutboundUrl(input);
+  if (guard === "public-only") return parseAndValidatePublicUrl(input);
+  if (guard === "block-metadata") return parseAndValidateNonMetadataUrl(input);
+  return parseOutboundUrl(input);
 }
 
-const defaultLookup: RemoteImageLookup = (hostname) =>
-  dns.promises.lookup(hostname, { all: true });
+function requireHttps(url: URL, enabled: boolean): URL {
+  if (enabled && url.protocol !== "https:") {
+    throw new Error("Remote media requires HTTPS at every redirect hop");
+  }
+  return url;
+}
 
-/**
- * Defence against DNS-rebinding SSRF (GHSA-cmhj-wh2f-9cgx). The
- * `parseAndValidatePublicUrl` guard only inspects the hostname *string*, so a
- * public-looking host that resolves to a private/loopback/link-local /
- * cloud-metadata address would otherwise be fetched. Resolve the host up-front
- * and reject if ANY answer is private (defeats the multi-A trick). IP literals
- * are skipped — they're already covered by the URL guard. This narrows but
- * does not fully close the TOCTOU window with fetch's own DNS resolution;
- * pinning the connection to the validated IP via undici would close it for
- * good, but is deferred to a follow-up so this fix stays surgical and
- * dependency-free.
- */
+const defaultLookup: RemoteImageLookup = (hostname) => dns.promises.lookup(hostname, { all: true });
+
+/** Resolve every answer, reject the host if any answer is private, then return
+ * the validated addresses so the caller can bind the connection to one of them. */
 async function assertHostnameResolvesPublic(
   url: URL,
   guard: OutboundUrlGuardMode,
   lookup: RemoteImageLookup
-): Promise<void> {
-  if (guard !== "public-only") return; // private-allowing modes skip this guard
+): Promise<Array<{ address: string; family: number }>> {
+  if (guard !== "public-only") return [];
   const hostname = url.hostname;
   const bare =
     hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
-  if (!bare) return;
-  if (isIP(bare)) return; // IP literal — already validated by the URL guard.
-
+  if (!bare) return [];
+  if (isIP(bare)) return [{ address: bare, family: isIP(bare) }];
   let resolved: Array<{ address: string; family: number }>;
   try {
     resolved = await lookup(bare);
@@ -86,8 +99,8 @@ async function assertHostnameResolvesPublic(
       throw new Error("Remote image host resolves to a blocked private address (DNS rebinding)");
     }
   }
+  return resolved;
 }
-
 function combineSignals(signal: AbortSignal | undefined, timeoutMs: number) {
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   if (!signal) return timeoutSignal;
@@ -133,22 +146,34 @@ async function readResponseBuffer(response: Response, maxBytes: number) {
   return Buffer.concat(chunks, totalBytes);
 }
 
-export async function fetchRemoteImage(
+export async function fetchRemoteMedia(
   input: string | URL,
-  options: RemoteImageFetchOptions = {}
-): Promise<RemoteImageFetchResult> {
-  const fetchImpl = options.fetchImpl ?? fetch;
+  options: RemoteMediaFetchOptions = {}
+): Promise<RemoteMediaFetchResult> {
+  const injectedFetch = options.fetchImpl;
+  // Default off: production callers that need connection pinning opt in. This keeps
+  // globalThis.fetch mockable for image-generation tests and preserves the previous
+  // DNS pre-check behavior for non-embedding callers.
+  const pinDns = options.pinDns === true;
   const guard = options.guard ?? getProviderOutboundGuard();
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_REMOTE_IMAGE_BYTES;
   const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
   const signal = combineSignals(options.signal, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const lookup = options.lookup ?? defaultLookup;
 
-  let currentUrl = validateRemoteImageUrl(input, guard);
+  let currentUrl = requireHttps(
+    validateRemoteImageUrl(input, guard),
+    options.enforceHttps === true
+  );
   for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
     // DNS-rebinding guard: validate every hop's hostname against its resolved
     // IPs before issuing the request (GHSA-cmhj-wh2f-9cgx).
-    await assertHostnameResolvesPublic(currentUrl, guard, lookup);
+    const addresses = await assertHostnameResolvesPublic(currentUrl, guard, lookup);
+    const fetchImpl =
+      injectedFetch ??
+      (pinDns && addresses.length
+        ? createPinnedFetch(addresses[0].address, addresses[0].family)
+        : fetch);
     const response = await fetchImpl(currentUrl.toString(), {
       method: "GET",
       redirect: "manual",
@@ -163,7 +188,10 @@ export async function fetchRemoteImage(
       if (redirectCount >= maxRedirects) {
         throw new Error(`Remote image exceeded ${maxRedirects} redirect limit`);
       }
-      currentUrl = validateRemoteImageUrl(new URL(location, currentUrl), guard);
+      currentUrl = requireHttps(
+        validateRemoteImageUrl(new URL(location, currentUrl), guard),
+        options.enforceHttps === true
+      );
       continue;
     }
 
@@ -179,4 +207,12 @@ export async function fetchRemoteImage(
   }
 
   throw new Error(`Remote image exceeded ${maxRedirects} redirect limit`);
+}
+
+/** Backward-compatible image-specific entry point. */
+export async function fetchRemoteImage(
+  input: string | URL,
+  options: RemoteImageFetchOptions = {}
+): Promise<RemoteImageFetchResult> {
+  return fetchRemoteMedia(input, options);
 }

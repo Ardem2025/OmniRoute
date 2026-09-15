@@ -11,8 +11,8 @@
 
 import {
   scorePool,
-  validateWeights,
   DEFAULT_WEIGHTS,
+  normalizeScoringWeights,
   type ScoringWeights,
   type ProviderCandidate,
   type ScoredProvider,
@@ -39,6 +39,7 @@ export interface AutoComboConfig {
    *     silently overspending.
    */
   budgetFallback?: "cheapest" | "strict";
+  estimatedInputTokens?: number; // tokens the budget is computed against (default 1000)
   explorationRate: number; // 0.05 = 5% exploratory
   /** If set, RouterStrategy name to use for selection ('rules' | 'cost' | 'latency') */
   routerStrategy?: string;
@@ -110,12 +111,15 @@ class ScoreTierRotator {
     const tiers = groupIntoTiers(candidates);
     const best = candidates[0].score;
     const worst = candidates[candidates.length - 1].score;
-    if (tiers.top.length > 0 && (best - worst) >= CLEAR_WINNER_THRESHOLD) {
+    if (tiers.top.length > 0 && best - worst >= CLEAR_WINNER_THRESHOLD) {
       return this.pickFromPool(tiers.top);
     }
     const prefs = tierPreferencesForName(this.comboName);
-    const chosen = chooseTierWeighted(tiers, prefs, (pool) => this.pickFromPool(pool), () =>
-      this.advance(tiers, prefs, candidates)
+    const chosen = chooseTierWeighted(
+      tiers,
+      prefs,
+      (pool) => this.pickFromPool(pool),
+      () => this.advance(tiers, prefs, candidates)
     );
     return chosen;
   }
@@ -248,7 +252,7 @@ export function selectProvider(
     const pack = getModePack(config.modePack);
     if (pack) weights = pack;
   }
-  if (!validateWeights(weights)) weights = DEFAULT_WEIGHTS;
+  weights = normalizeScoringWeights(weights);
 
   // Filter out excluded providers
   const excluded: string[] = [];
@@ -308,9 +312,13 @@ export function selectProvider(
     for (const c of candidates) {
       costMap.set(`${c.provider}\0${c.model}`, c.costPer1MTokens);
     }
+    const estimatedTokens =
+      Number.isFinite(config.estimatedInputTokens) && config.estimatedInputTokens! > 0
+        ? config.estimatedInputTokens!
+        : 1000;
     const estimatedCostFor = (s: ScoredProvider) => {
       const cost = costMap.get(`${s.provider}\0${s.model}`) ?? 0;
-      return (cost / 1_000_000) * 1000;
+      return (cost / 1_000_000) * estimatedTokens;
     };
     if (estimatedCostFor(selected) > config.budgetCap) {
       const budgetOk = candidates_.filter((s) => estimatedCostFor(s) <= config.budgetCap!);
@@ -322,7 +330,10 @@ export function selectProvider(
           (a, b) => estimatedCostFor(a) - estimatedCostFor(b)
         )[0];
         if (config.budgetFallback === "strict") {
-          throw new BudgetExceededError(config.budgetCap, cheapest ? estimatedCostFor(cheapest) : 0);
+          throw new BudgetExceededError(
+            config.budgetCap,
+            cheapest ? estimatedCostFor(cheapest) : 0
+          );
         }
         if (cheapest) selected = cheapest;
       }

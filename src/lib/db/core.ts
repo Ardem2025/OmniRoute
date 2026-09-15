@@ -4,16 +4,26 @@
  * All domain modules import `getDbInstance` and helpers from here.
  */
 
-import type { SqliteAdapter } from "./adapters/types";
+import type { SqliteAdapter, PreparedStatement } from "./adapters/types";
 import {
   tryOpenSync,
   getSqlJsAdapter,
   preInitSqlJs,
+  getSqlJsPreInitError,
   openDatabaseAsync,
 } from "./adapters/driverFactory";
 import path from "path";
+import { retryProbeIfTransient } from "./probeUtils";
 import fs from "fs";
 import { resolveWritableDataDir, getLegacyDotDataDir } from "../dataPaths";
+import {
+  MAX_DB_BACKUPS,
+  DEFAULT_DB_BACKUP_RETENTION_DAYS,
+  parsePositiveInt,
+  parseNonNegativeInt,
+  pruneBackupDirectory,
+} from "./backupRetention";
+import { isNextBuildPhase } from "../buildPhase";
 import { runMigrations } from "./migrationRunner";
 import { runDbHealthCheck } from "./healthCheck";
 import { resetAllDbModuleState } from "./stateReset";
@@ -35,10 +45,22 @@ import {
 import { migrateLegacyEncryptedString } from "./encryption";
 import { invalidateDbCache } from "./readCache";
 import { rowToCamel } from "./caseMapping";
+import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
+import { parseModelAccessMode } from "./apiKeys/modelAccessMode";
+import { getExistingDbInstance as getDb, setDbInstance as setDb } from "./singleton";
+import type { WalCheckpointMode } from "./walMaintenance";
+import {
+  startWalMaintenance,
+  stopWalMaintenance,
+  runCheckpointNow,
+  getWalMaintenanceState,
+  logCheckpointOutcome,
+} from "./walMaintenance";
 // Re-exported so existing call sites that pull these helpers off the core module keep working.
 export { toSnakeCase, toCamelCase, objToSnake, rowToCamel, cleanNulls } from "./caseMapping";
 import {
   ensureProviderConnectionsColumns,
+  ensureUsageHistoryAccountIndex,
   ensureUsageHistoryColumns,
   ensureCallLogsColumns,
   hasTable,
@@ -48,7 +70,6 @@ import {
 
 type SqliteDatabase = SqliteAdapter;
 type JsonRecord = Record<string, unknown>;
-type CheckpointMode = "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE";
 type DatabaseOptimizationSettings = DatabaseSettings["optimization"];
 type PreservedTableSnapshot = {
   table: string;
@@ -79,7 +100,18 @@ type CriticalTableSpec = {
 
 export const isCloud = typeof globalThis.caches === "object" && globalThis.caches !== null;
 
-export const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
+// Next.js build workers sometimes drop NEXT_PHASE from their env, so
+// OMNIROUTE_BUILDING=1 (set by build-next-isolated.mjs and inherited by every
+// spawned build worker) is the reliable build signal. During build the native
+// better-sqlite3 addon must never load: its Statement destructor aborts with
+// SIGABRT when the worker thread exits (assertion in
+// node::RemoveEnvironmentCleanupHook, env == nullptr). (#10060)
+//
+// Delegates to the shared leaf helper (src/lib/buildPhase.ts) so every build
+// signal is defined in exactly one place. Kept as a module const (evaluated at
+// import time) to preserve the existing eager-boolean semantics of the many
+// `if (isBuildPhase || isCloud)` call sites across the db layer.
+export const isBuildPhase = isNextBuildPhase();
 
 // ──────────────── Paths ────────────────
 
@@ -155,6 +187,23 @@ function getErrorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
+/**
+ * Closes a probe/throwaway connection obtained from `openSqliteDatabase()` —
+ * but ONLY when it is safe to do so. better-sqlite3/node:sqlite hand back an
+ * independent handle per open() call, so closing a probe never affects a
+ * later "real" connection to the same file. sql.js has no such notion: its
+ * fallback path (`getSqlJsAdapter()`) always returns the SAME module-global
+ * cached singleton for a given filePath, so closing "the probe" closes the
+ * ONLY connection that file will ever get until process restart — every
+ * subsequent query (including the "real" connection opened right after)
+ * throws sql.js's raw "Database closed" string (#7494). Skip the close for
+ * sql.js and let the same live adapter flow through untouched.
+ */
+export function closeProbeIfSafe(adapter: SqliteDatabase | null | undefined): void {
+  if (!adapter || adapter.driver === "sql.js") return;
+  if (adapter.open) adapter.close();
+}
+
 function openSqliteDatabase(sqliteFile: string, options?: Record<string, unknown>): SqliteDatabase {
   const adapter = tryOpenSync(sqliteFile, options);
   if (adapter) return adapter;
@@ -162,10 +211,25 @@ function openSqliteDatabase(sqliteFile: string, options?: Record<string, unknown
   const sqlJs = getSqlJsAdapter(sqliteFile);
   if (sqlJs) return sqlJs;
 
+  // sql.js pre-init was genuinely attempted (e.g. by the top-level eager
+  // barrier below) and failed — surface the real cause instead of the
+  // generic/misleading "not pre-initialized yet" message (#7288).
+  const preInitError = getSqlJsPreInitError(sqliteFile);
+  const syncDrivers = process.versions.bun
+    ? "bun:sqlite (failed)"
+    : "better-sqlite3 (failed), node:sqlite (unavailable)";
+  if (preInitError) {
+    throw new Error(
+      `[DB] Nenhum driver SQLite disponível para '${sqliteFile}'. ` +
+        `Drivers testados: ${syncDrivers}, ` +
+        `sql.js (falhou: ${preInitError}).`
+    );
+  }
+
   throw new Error(
     `[DB] Nenhum driver SQLite disponível para '${sqliteFile}'. ` +
       "Chame ensureDbInitialized() no startup. " +
-      "Drivers testados: better-sqlite3 (falhou), node:sqlite (indisponível). " +
+      `Drivers testados: ${syncDrivers}. ` +
       "sql.js WASM ainda não foi pré-inicializado."
   );
 }
@@ -227,6 +291,7 @@ const SCHEMA_SQL = `
     max_concurrent INTEGER,
     proxy_enabled INTEGER NOT NULL DEFAULT 1,
     per_key_proxy_enabled INTEGER NOT NULL DEFAULT 0,
+    quota_visible INTEGER NOT NULL DEFAULT 1,
     quota_window_thresholds_json TEXT,
     rate_limit_overrides_json TEXT,
     created_at TEXT NOT NULL,
@@ -287,6 +352,9 @@ const SCHEMA_SQL = `
     provider TEXT,
     model TEXT,
     connection_id TEXT,
+    account_key TEXT,
+    account_label TEXT,
+    account_label_priority INTEGER DEFAULT 0,
     api_key_id TEXT,
     api_key_name TEXT,
     tokens_input INTEGER DEFAULT 0,
@@ -346,6 +414,13 @@ const SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_cl_timestamp ON call_logs(timestamp);
   CREATE INDEX IF NOT EXISTS idx_cl_status ON call_logs(status);
+  CREATE INDEX IF NOT EXISTS idx_cl_provider_timestamp ON call_logs(provider, timestamp);
+  -- idx_cl_request_provider is NOT declared here: SCHEMA_SQL runs before
+  -- ensureCallLogsColumns() heals a legacy call_logs table, and a lineage that
+  -- predates the request_type column has none yet — the CREATE INDEX would abort
+  -- the whole schema exec with "no such column: request_type" and the server would
+  -- never boot. It is created next to the other request_type/combo indexes in
+  -- ensureCallLogsColumns() (db/schemaColumns.ts), after the columns exist.
 
   CREATE TABLE IF NOT EXISTS proxy_logs (
     id TEXT PRIMARY KEY,
@@ -456,34 +531,46 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_quota_snapshots_created_at ON quota_snapshots(created_at);
 `;
 
+// `CREATE TABLE IF NOT EXISTS` is a no-op against a legacy database that already owns the
+// table with an older column set — but the `CREATE INDEX` statements that follow it are
+// not: they still reference columns the ensure*Columns() healers have yet to backfill, so
+// running the whole schema in one exec aborts startup with "no such column". That is how
+// the composite idx_cl_request_provider index (#12832) broke booting on a pre-007
+// `call_logs` lineage. Split the inline schema so the boot order can be: create tables →
+// heal legacy columns → create indexes.
+function splitSchemaStatements(schemaSql: string): { tables: string; indexes: string } {
+  const tables: string[] = [];
+  const indexes: string[] = [];
+  for (const rawStatement of schemaSql.split(";")) {
+    const statement = rawStatement.trim();
+    if (!statement) continue;
+    // Classify on the first SQL keyword, ignoring any leading `--` comment lines.
+    const sql = statement.replace(/^(?:[ \t]*--[^\n]*\n)+/, "").trimStart();
+    (/^CREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(sql) ? indexes : tables).push(`${statement};`);
+  }
+  return { tables: tables.join("\n"), indexes: indexes.join("\n") };
+}
+
+const { tables: SCHEMA_TABLES_SQL, indexes: SCHEMA_INDEXES_SQL } =
+  splitSchemaStatements(SCHEMA_SQL);
+
 // ──────────────── Singleton DB Instance ────────────────
 // Use globalThis to survive Next.js dev HMR module re-evaluation.
 // Module-level `let` resets on every webpack recompile, causing connection leaks.
 
 declare global {
-  var __omnirouteDb: SqliteAdapter | undefined;
   // Cycle-breaker counter for the probe-failed/restore cascade. Survives
   // Next.js HMR re-evaluations so concurrent subsystems all see the same
   // count and we abort with a clear error instead of looping forever.
   var __omnirouteDbProbeRestoreCount: number | undefined;
-}
-
-function getDb(): SqliteDatabase | null {
-  return globalThis.__omnirouteDb ?? null;
-}
-
-function setDb(db: SqliteDatabase | null): void {
-  if (db) {
-    globalThis.__omnirouteDb = db;
-  } else {
-    delete globalThis.__omnirouteDb;
-  }
-}
-
-function checkpointDb(db: SqliteDatabase, mode: CheckpointMode = "TRUNCATE"): boolean {
-  if (isCloud || isBuildPhase || !SQLITE_FILE) return false;
-  db.pragma(`wal_checkpoint(${mode})`);
-  return true;
+  // Cycle-breaker counter for the OOM-during-probe path (#6835). Unlike the
+  // generic corruption path above, an OOM probe failure never renames the
+  // file away (intentional — the DB may be perfectly fine, just too large
+  // for the current heap), so the restore-count cap above is structurally
+  // unreachable here. Without an independent cap, every background poller
+  // (BATCH, HealthCheck, ProviderLimitsSync, ModelSync) re-throws the same
+  // OOM error forever with no terminal diagnostic.
+  var __omnirouteDbOomFailureCount: number | undefined;
 }
 
 function summarizePreservedTables(tables: PreservedTableSnapshot[]): string {
@@ -574,7 +661,7 @@ function captureCriticalDbState(sqliteFile: string): PreservedCriticalDbState {
     return snapshot;
   } finally {
     try {
-      probe?.close();
+      closeProbeIfSafe(probe);
     } catch {
       /* ignore */
     }
@@ -787,15 +874,6 @@ function offloadLegacyCallLogDetails(db: SqliteDatabase) {
   }
 }
 
-function isAutomatedTestProcess(): boolean {
-  return (
-    typeof process !== "undefined" &&
-    (process.env.NODE_ENV === "test" ||
-      process.env.VITEST !== undefined ||
-      process.argv.some((arg) => arg.includes("test")))
-  );
-}
-
 function shouldRunStartupDbHealthCheck(): boolean {
   if (process.env.OMNIROUTE_FORCE_DB_HEALTHCHECK === "1") return true;
   return !isAutomatedTestProcess();
@@ -817,6 +895,25 @@ function createManagedDbBackup(db: SqliteDatabase, reason: string): boolean {
 
     db.exec(`VACUUM INTO '${escapedBackupPath}'`);
     console.log(`[DB] Backup created (${reason}): ${backupPath}`);
+
+    // Prune old backups to prevent the directory from growing without bound.
+    // This mirrors the post-backup pruning in backup.ts but avoids a circular
+    // dependency by importing directly from backupRetention.ts.
+    try {
+      const maxFiles = process.env.DB_BACKUP_MAX_FILES
+        ? parsePositiveInt(process.env.DB_BACKUP_MAX_FILES, MAX_DB_BACKUPS)
+        : MAX_DB_BACKUPS;
+      const retentionDays = process.env.DB_BACKUP_RETENTION_DAYS
+        ? parseNonNegativeInt(
+            process.env.DB_BACKUP_RETENTION_DAYS,
+            DEFAULT_DB_BACKUP_RETENTION_DAYS
+          )
+        : DEFAULT_DB_BACKUP_RETENTION_DAYS;
+      pruneBackupDirectory({ backupDir, maxFiles, retentionDays });
+    } catch {
+      // Retention is best-effort; never let a pruning failure obscure the backup result.
+    }
+
     return true;
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -922,6 +1019,10 @@ function startDbHealthCheckScheduler(db: SqliteDatabase) {
   dbHealthCheckTimer.unref?.();
 }
 
+// Auto-checkpoint moves WAL pages back into the main DB file but never shrinks the WAL
+// file itself; only wal_checkpoint(TRUNCATE) does, and a long-running server never closes its DB.
+// The scheduler lives in ./walMaintenance (periodic TRUNCATE + busy warn + PASSIVE retry).
+
 export function runManagedDbHealthCheck(options?: { autoRepair?: boolean }) {
   const db = getDbInstance();
   return runDbHealthCheck(db, {
@@ -937,12 +1038,40 @@ export function getDbInstance(): SqliteDatabase {
 
   if (isCloud || isBuildPhase) {
     if (isBuildPhase) {
-      console.log("[DB] Build phase detected — using in-memory SQLite (read-only)");
+      console.log("[DB] Build phase detected — using no-op SQLite stub (never queried)");
+      // A no-op stub during build avoids loading the better-sqlite3 native
+      // bindings entirely. The native Statement destructor crashes with SIGABRT
+      // when the Next.js build worker thread exits (assertion in
+      // node::RemoveEnvironmentCleanupHook, env == nullptr). The DB is never
+      // actually queried during build — it only exists so module-eval that
+      // touches getDbInstance() at build time does not throw. (#10060)
+      const noopStatement: PreparedStatement = {
+        run: () => ({ changes: 0, lastInsertRowid: 0 }),
+        get: () => undefined,
+        all: () => [],
+      };
+      const stubDb: SqliteDatabase = {
+        driver: "sql.js",
+        open: true,
+        name: ":memory:",
+        prepare: () => noopStatement,
+        exec: () => {},
+        pragma: () => undefined,
+        transaction: <T>(fn: (...args: unknown[]) => T) => fn,
+        immediate: (fn: () => void) => fn(),
+        backup: async () => {},
+        checkpoint: () => {},
+        close: () => {},
+        raw: null,
+      };
+      setDb(stubDb);
+      return stubDb;
     }
     const memoryDb = openSqliteDatabase(":memory:");
     memoryDb.pragma("journal_mode = WAL");
     memoryDb.exec(SCHEMA_SQL);
     ensureUsageHistoryColumns(memoryDb);
+    ensureUsageHistoryAccountIndex(memoryDb);
     ensureCallLogsColumns(memoryDb);
     ensureProviderConnectionsColumns(memoryDb);
     setDb(memoryDb);
@@ -1005,13 +1134,35 @@ export function getDbInstance(): SqliteDatabase {
   // This is needed so the migration runner skips the mass-migration safety abort
   // that would otherwise trigger because heuristic seeding marks some migrations
   // as applied, making the fresh DB look like a wiped existing DB (#1328).
-  const isNewDb = !fs.existsSync(sqliteFile);
+  // #9934: also classify a setup-created skeleton as logically fresh for the mass guard,
+  // while tracking its pre-existing file independently for mandatory snapshot safety.
+  const databaseExistedBeforeInitialization = fs.existsSync(sqliteFile);
+  let isNewDb = !databaseExistedBeforeInitialization;
 
   // Detect and handle old schema format — preserve data when possible (#146)
   // Uses a single probe connection that becomes the real connection when possible.
   if (fs.existsSync(sqliteFile)) {
     try {
       const probe = openSqliteDatabase(sqliteFile, { readonly: true });
+      // #9934: init asymmetry — bin/cli/sqlite.mjs::openOmniRouteDb (used by
+      // `omniroute setup`) creates storage.sqlite with only the partial inline
+      // schema (key_value + provider_connections) and never runs migrations.
+      // Purely file-existence-based freshness made that file look like an
+      // existing DB, so the first `serve` auto-seeded only the 001 marker and
+      // tripped the mass-migration safety abort on a brand-new install. A
+      // skeleton file has provider_connections but none of the tables the 001
+      // migration creates (combos) — treat it as fresh, not as a wiped DB.
+      const probeHasProviderConnections = !!probe
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='provider_connections'"
+        )
+        .get();
+      const probeHasCombos = !!probe
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='combos'")
+        .get();
+      if (probeHasProviderConnections && !probeHasCombos) {
+        isNewDb = true;
+      }
       const hasOldSchema = probe
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")
         .get();
@@ -1020,13 +1171,12 @@ export function getDbInstance(): SqliteDatabase {
         let hasData = false;
         try {
           const count = probe.prepare("SELECT COUNT(*) as c FROM provider_connections").get() as
-            | { c: number }
-            | undefined;
+            { c: number } | undefined;
           hasData = Boolean(count && count.c > 0);
         } catch {
           // Table might not exist at all — truly incompatible
         }
-        probe.close();
+        closeProbeIfSafe(probe);
 
         if (hasData) {
           console.log(
@@ -1040,7 +1190,7 @@ export function getDbInstance(): SqliteDatabase {
             const message = e instanceof Error ? e.message : String(e);
             console.warn("[DB] Could not clean up old schema table:", message);
           } finally {
-            fixDb.close();
+            closeProbeIfSafe(fixDb);
           }
         } else {
           const oldPath = sqliteFile + ".old-schema";
@@ -1057,7 +1207,7 @@ export function getDbInstance(): SqliteDatabase {
           }
         }
       } else {
-        probe.close();
+        closeProbeIfSafe(probe);
       }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
@@ -1075,7 +1225,27 @@ export function getDbInstance(): SqliteDatabase {
       // V8 heap (sql.js loads the whole file into WASM memory). Throwing
       // immediately gives the user a clear "increase --max-old-space-size"
       // signal instead of silently renaming a perfectly good DB.
-      if (/out of memory|allocation failure|Array buffer allocation failed|allocation failed/i.test(message)) {
+      if (
+        /out of memory|allocation failure|Array buffer allocation failed|allocation failed/i.test(
+          message
+        )
+      ) {
+        // Cycle-breaker (#6835): the OOM path never renames the file away,
+        // so it never trips the generic probe-failed/restore cap above. Cap
+        // it independently after 3 consecutive OOM failures (same threshold
+        // as the generic path) so repeated polling doesn't hang forever with
+        // no actionable terminal diagnostic.
+        if (
+          (globalThis.__omnirouteDbOomFailureCount =
+            (globalThis.__omnirouteDbOomFailureCount || 0) + 1) > 3
+        ) {
+          throw new Error(
+            `[DB] Aborting startup: persistent out-of-memory probing ${sqliteFile} after 3 attempts. ` +
+              `Increase the V8 heap with NODE_OPTIONS=--max-old-space-size=4096 (or higher) — the ` +
+              `current heap is insufficient for this database — and restart, or shrink/restore the ` +
+              `database from a backup. Original error: ${message}`
+          );
+        }
         throw new Error(
           `[DB] Out of memory while probing ${sqliteFile}. ` +
             `The bundled sql.js driver loads the entire file into WASM memory; ` +
@@ -1084,18 +1254,19 @@ export function getDbInstance(): SqliteDatabase {
             `Original error: ${message}`
         );
       }
-      preservedCriticalState = captureCriticalDbState(sqliteFile);
-
-      // SAFETY: Never delete the database — rename to backup so data can be recovered.
-      // The old code would silently destroy all user data on any probe failure.
-      const failedPath = sqliteFile + `.probe-failed-${Date.now()}`;
-      try {
-        fs.renameSync(sqliteFile, failedPath);
-        console.warn(`[DB] Renamed corrupt DB to ${path.basename(failedPath)}`);
-        failedProbePath = failedPath;
-        failedProbeMessage = message;
-      } catch {
-        /* ok */
+      if (!retryProbeIfTransient(sqliteFile, e, openSqliteDatabase, closeProbeIfSafe)) {
+        preservedCriticalState = captureCriticalDbState(sqliteFile);
+        // SAFETY: Never delete the database — rename to backup so data can be recovered.
+        // The old code would silently destroy all user data on any probe failure.
+        const failedPath = sqliteFile + `.probe-failed-${Date.now()}`;
+        try {
+          fs.renameSync(sqliteFile, failedPath);
+          console.warn(`[DB] Renamed corrupt DB to ${path.basename(failedPath)}`);
+          failedProbePath = failedPath;
+          failedProbeMessage = message;
+        } catch {
+          /* ok */
+        }
       }
     }
   }
@@ -1117,19 +1288,35 @@ export function getDbInstance(): SqliteDatabase {
   }
 
   const db = openSqliteDatabase(sqliteFile);
-  db.pragma("journal_mode = WAL");
+  // Emit the same "[DB] Driver: ..." line openDatabaseAsync() prints so the
+  // packaged-app smoke guard (#7592) can assert the native driver was
+  // selected on the server's primary DB path too, not only the backup-import
+  // route.
+  console.log(`[DB] Driver: ${db.driver} | file: ${sqliteFile}`);
   // better-sqlite3 is synchronous, so a contended write parks the Node event loop for up to
   // busy_timeout ms (a 0-CPU freeze that stacks under load → /health stops responding). The
   // hot-path writers here (usage_history, call_logs) are best-effort and the WinUI host opens
   // the same DB, so cap the block at 2s instead of 5s: normal writes complete in <1ms, and a
   // contended op can no longer freeze the loop past the host watchdog's 6s liveness probe.
+  //
+  // Install the busy handler before the connection's first statement. `journal_mode = WAL`
+  // needs a SHARED lock, and another process closing its WAL connection briefly holds the
+  // file EXCLUSIVE (checkpoint + WAL delete); node:sqlite opens with busy timeout 0, so with
+  // the pragmas in the other order that window surfaced as `database is locked` at startup.
   db.pragma("busy_timeout = 2000");
+  db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL");
   db.pragma(`cache_size = -${DEFAULT_DATABASE_SETTINGS.optimization.cacheSize}`);
-  db.exec(SCHEMA_SQL);
+  db.pragma("temp_store = MEMORY");
+  // Tables first, then the legacy-column healers, and only then the indexes: an upgraded
+  // database can already own call_logs/usage_history/provider_connections with an older
+  // column set, where the CREATE TABLE is a no-op but the indexes still reference columns
+  // the healers below are the ones adding.
+  db.exec(SCHEMA_TABLES_SQL);
   ensureProviderConnectionsColumns(db);
   ensureUsageHistoryColumns(db);
   ensureCallLogsColumns(db);
+  db.exec(SCHEMA_INDEXES_SQL);
 
   // ── Versioned Migrations ──
   // Auto-seed 001 as applied (the inline SCHEMA_SQL already created these tables)
@@ -1144,9 +1331,25 @@ export function getDbInstance(): SqliteDatabase {
     VALUES ('001', 'initial_schema');
   `);
 
-  runMigrations(db, { isNewDb });
+  runMigrations(db, { isNewDb, databaseExistedBeforeInitialization });
+  // Fresh installs need the same post-migration index guarantee as upgraded
+  // databases, including recovery from an interrupted migration 127 attempt.
+  ensureUsageHistoryAccountIndex(db);
 
   applyStoredDatabaseOptimizationSettings(db);
+
+  // Apply mmap_size from stored settings (migration 046), fallback to 256MiB
+  try {
+    const mmapRow = db
+      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+      .get("databaseSettings", "mmapSize") as { value: string } | undefined;
+    const mmapSize = mmapRow ? Math.max(0, parseInt(mmapRow.value, 10) || 0) : 268435456;
+    if (mmapSize > 0) {
+      db.pragma(`mmap_size = ${mmapSize}`);
+    }
+  } catch {
+    // mmap_size is best-effort; not available in all runtimes (e.g. web)
+  }
 
   offloadLegacyCallLogDetails(db);
 
@@ -1166,7 +1369,7 @@ export function getDbInstance(): SqliteDatabase {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       try {
-        if (db.open) db.close();
+        closeProbeIfSafe(db);
       } catch {
         /* ignore */
       }
@@ -1208,6 +1411,7 @@ export function getDbInstance(): SqliteDatabase {
   }
 
   startDbHealthCheckScheduler(db);
+  startWalMaintenance(db, SQLITE_FILE);
   // Log the resolved absolute DATA_DIR + SQLITE_FILE once at init so a
   // multi-replica / Docker volume-topology mismatch (each replica opening a
   // different on-disk DB → "phantom"/missing combos & connections) is
@@ -1233,8 +1437,10 @@ export function pingDb(): boolean {
   }
 }
 
-export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | null }): boolean {
+export function closeDbInstance(options?: { checkpointMode?: WalCheckpointMode | null }): boolean {
   clearDbHealthCheckScheduler();
+  const streakBefore = getWalMaintenanceState().busyStreak;
+  stopWalMaintenance();
   const db = getDb();
   if (!db) return false;
 
@@ -1243,9 +1449,12 @@ export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | nu
   try {
     if (checkpointMode) {
       try {
-        if (checkpointDb(db, checkpointMode)) {
-          console.log(`[DB] SQLite WAL checkpoint completed (${checkpointMode}).`);
-        }
+        const outcome = runCheckpointNow(db, checkpointMode, {
+          sqliteFile: SQLITE_FILE,
+          isCloud,
+          isBuildPhase,
+        });
+        logCheckpointOutcome(outcome, checkpointMode, streakBefore);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`[DB] WAL checkpoint failed during close (${checkpointMode}):`, message);
@@ -1273,6 +1482,10 @@ export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | nu
  */
 export function resetDbInstance() {
   closeDbInstance();
+  // Read caches outlive the SQLite singleton. A reset swaps the backing
+  // database, so retaining cached rows can leak the previous database's
+  // connections/settings into the newly opened instance (tests and restore).
+  invalidateDbCache();
 }
 
 // ──────────────── Runtime Driver Info ────────────────
@@ -1477,11 +1690,9 @@ function migrateFromJson(db: SqliteDatabase, jsonPath: string) {
           updatedAt: normalizedCombo.updatedAt || new Date().toISOString(),
         });
       }
-
-      // 5. API Keys
       const insertKey = db.prepare(`
-        INSERT OR REPLACE INTO api_keys (id, name, key, machine_id, allowed_models, no_log, created_at)
-        VALUES (@id, @name, @key, @machineId, @allowedModels, @noLog, @createdAt)
+        INSERT OR REPLACE INTO api_keys (id, name, key, machine_id, model_access_mode, allowed_models, no_log, created_at)
+        VALUES (@id, @name, @key, @machineId, @modelAccessMode, @allowedModels, @noLog, @createdAt)
       `);
       for (const apiKey of data.apiKeys || []) {
         insertKey.run({
@@ -1489,6 +1700,7 @@ function migrateFromJson(db: SqliteDatabase, jsonPath: string) {
           name: apiKey.name,
           key: apiKey.key,
           machineId: apiKey.machineId || null,
+          modelAccessMode: parseModelAccessMode(apiKey.modelAccessMode, apiKey.allowedModels),
           allowedModels: JSON.stringify(apiKey.allowedModels || []),
           noLog: apiKey.noLog ? 1 : 0,
           createdAt: apiKey.createdAt || new Date().toISOString(),

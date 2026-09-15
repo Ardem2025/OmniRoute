@@ -18,6 +18,8 @@ export function assembleStreamingResponseHeaders(
     model: string | null | undefined;
     pendingRequestId: string;
     compressionResponseMeta?: string | null | undefined;
+    comboStrategy?: string | null | undefined;
+    fallbackAttempts?: number;
   },
   buildStreamingResponseHeaders: typeof defaultBuildStreaming = defaultBuildStreaming
 ): Record<string, string> {
@@ -29,6 +31,8 @@ export function assembleStreamingResponseHeaders(
       latencyMs: 0,
       usage: null,
       costUsd: 0,
+      strategy: args.comboStrategy ?? "single",
+      ...(args.fallbackAttempts !== undefined ? { fallbackAttempts: args.fallbackAttempts } : {}),
     }),
     "x-omniroute-request-id": args.pendingRequestId,
   };
