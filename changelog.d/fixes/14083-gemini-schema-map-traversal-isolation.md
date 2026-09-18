@@ -1,0 +1,1 @@
+- **fix(gemini):** isolate schema map traversal to prevent injecting fictitious properties into property maps and schema maps during Antigravity normalization (#14083) — thanks @Ardem2025

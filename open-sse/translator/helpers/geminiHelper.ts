@@ -342,6 +342,25 @@ const SCHEMA_MAP_KEYS = new Set([
   "dependentSchemas",
 ]);
 
+function walkSchemaEntry(key: string, value: unknown, visitor: (child: unknown) => void): void {
+  if (!value || typeof value !== "object") return;
+  if (SCHEMA_MAP_KEYS.has(key) && !Array.isArray(value)) {
+    for (const subSchema of Object.values(value as JsonRecord)) {
+      if (subSchema && typeof subSchema === "object") {
+        visitor(subSchema);
+      }
+    }
+    return;
+  }
+  visitor(value);
+}
+
+function walkSchemaChildren(record: JsonRecord, visitor: (child: unknown) => void): void {
+  for (const [key, value] of Object.entries(record)) {
+    walkSchemaEntry(key, value, visitor);
+  }
+}
+
 const SCHEMA_NODE_KEYS = new Set([
   "additionalItems",
   "additionalProperties",
@@ -419,53 +438,33 @@ function promoteBooleanRequired(record: JsonRecord): void {
 // Pre-pass for Cloud Code (#12269): boolean `required` on a property and nested
 // bare property maps both survive the later phases and 400 Gemini's proto.
 // Mirrors CLIProxyAPI normalizeMalformedSchemaObjects.
-function normalizeMalformedSchemaObjects(obj: unknown, parentKey?: string): void {
+function normalizeMalformedSchemaObjects(obj: unknown): void {
   if (!obj || typeof obj !== "object") return;
 
   if (Array.isArray(obj)) {
     for (const item of obj) {
-      normalizeMalformedSchemaObjects(item, parentKey);
+      normalizeMalformedSchemaObjects(item);
     }
     return;
   }
 
   const record = obj as JsonRecord;
-  if (parentKey === undefined || !SCHEMA_MAP_KEYS.has(parentKey)) {
-    if (isBarePropertyMap(record)) {
-      const props = { ...record };
-      for (const key of Object.keys(record)) {
-        delete record[key];
-      }
-      record.type = "object";
-      record.properties = props;
+  if (isBarePropertyMap(record)) {
+    const props = { ...record };
+    for (const key of Object.keys(record)) {
+      delete record[key];
     }
+    record.type = "object";
+    record.properties = props;
   }
 
   promoteBooleanRequired(record);
 
-  for (const [key, value] of Object.entries(record)) {
-    if (value && typeof value === "object") {
-      normalizeMalformedSchemaObjects(value, key);
-    }
-  }
+  walkSchemaChildren(record, normalizeMalformedSchemaObjects);
 }
 
 function decodeJsonPointerSegment(segment: unknown): string {
   return String(segment).replace(/~1/g, "/").replace(/~0/g, "~");
-}
-
-// Helper: Recurse into schema children without treating the properties map itself as a SchemaNode.
-function forEachSubschema(record: JsonRecord, visitor: (sub: unknown) => void): void {
-  for (const [key, value] of Object.entries(record)) {
-    if (!value || typeof value !== "object") continue;
-    if (SCHEMA_MAP_KEYS.has(key) && !Array.isArray(value)) {
-      for (const subSchema of Object.values(value as JsonRecord)) {
-        visitor(subSchema);
-      }
-    } else {
-      visitor(value);
-    }
-  }
 }
 
 function resolveLocalReference(root: unknown, ref: unknown): unknown | null {
@@ -552,7 +551,12 @@ function removeUnsupportedKeywords(obj: unknown, keywords: Set<string>): void {
       delete record[key];
     }
   }
-  forEachSubschema(record, (sub) => removeUnsupportedKeywords(sub, keywords));
+  // Recurse into remaining values. `properties` is a map keyed by arbitrary,
+  // user-defined property NAMES — a tool may legitimately declare a property
+  // called `pattern`, `enum`, `minLength`, etc. Descend into each property's
+  // subschema, but never run keyword-deletion against the property names
+  // themselves, or glob/grep-style tools lose their `pattern` argument (#1368).
+  walkSchemaChildren(record, (child) => removeUnsupportedKeywords(child, keywords));
 }
 
 function normalizeAdditionalProperties(obj: unknown): void {
@@ -574,19 +578,12 @@ function normalizeAdditionalProperties(obj: unknown): void {
     delete record.additionalProperties;
   }
 
-  forEachSubschema(record, normalizeAdditionalProperties);
+  walkSchemaChildren(record, normalizeAdditionalProperties);
 }
 
 // Convert const to enum
 function convertConstToEnum(obj: unknown): void {
   if (!obj || typeof obj !== "object") return;
-
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      convertConstToEnum(item);
-    }
-    return;
-  }
 
   const record = obj as JsonRecord;
   if (record.const !== undefined && !record.enum) {
@@ -594,20 +591,13 @@ function convertConstToEnum(obj: unknown): void {
     delete record.const;
   }
 
-  forEachSubschema(record, convertConstToEnum);
+  walkSchemaChildren(record, convertConstToEnum);
 }
 
 // Convert enum values to strings (Gemini requires string enum values)
 // For integer types, remove enum entirely as Gemini doesn't support it
 function convertEnumValuesToStrings(obj: unknown): void {
   if (!obj || typeof obj !== "object") return;
-
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      convertEnumValuesToStrings(item);
-    }
-    return;
-  }
 
   const record = obj as JsonRecord;
   if (record.enum && Array.isArray(record.enum)) {
@@ -622,19 +612,12 @@ function convertEnumValuesToStrings(obj: unknown): void {
     }
   }
 
-  forEachSubschema(record, convertEnumValuesToStrings);
+  walkSchemaChildren(record, convertEnumValuesToStrings);
 }
 
 // Merge allOf schemas
 function mergeAllOf(obj: unknown): void {
   if (!obj || typeof obj !== "object") return;
-
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      mergeAllOf(item);
-    }
-    return;
-  }
 
   const record = obj as JsonRecord;
   if (record.allOf && Array.isArray(record.allOf)) {
@@ -668,7 +651,7 @@ function mergeAllOf(obj: unknown): void {
     }
   }
 
-  forEachSubschema(record, mergeAllOf);
+  walkSchemaChildren(record, mergeAllOf);
 }
 
 // Select best schema from anyOf/oneOf
@@ -702,13 +685,6 @@ function selectBest(items: unknown[]): number {
 function flattenAnyOfOneOf(obj: unknown): void {
   if (!obj || typeof obj !== "object") return;
 
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      flattenAnyOfOneOf(item);
-    }
-    return;
-  }
-
   const record = obj as JsonRecord;
   if (record.anyOf && Array.isArray(record.anyOf) && record.anyOf.length > 0) {
     const nonNullSchemas = record.anyOf.filter((s) => s && toRecord(s).type !== "null");
@@ -730,19 +706,12 @@ function flattenAnyOfOneOf(obj: unknown): void {
     }
   }
 
-  forEachSubschema(record, flattenAnyOfOneOf);
+  walkSchemaChildren(record, flattenAnyOfOneOf);
 }
 
 // Flatten type arrays
 function flattenTypeArrays(obj: unknown): void {
   if (!obj || typeof obj !== "object") return;
-
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      flattenTypeArrays(item);
-    }
-    return;
-  }
 
   const record = obj as JsonRecord;
   if (record.type && Array.isArray(record.type)) {
@@ -750,58 +719,169 @@ function flattenTypeArrays(obj: unknown): void {
     record.type = nonNullTypes.length > 0 ? nonNullTypes[0] : "string";
   }
 
-  forEachSubschema(record, flattenTypeArrays);
+  walkSchemaChildren(record, flattenTypeArrays);
+}
+
+const VALID_PROTOBUF_TYPES = new Set([
+  "string",
+  "number",
+  "integer",
+  "boolean",
+  "array",
+  "object",
+]);
+
+function sanitizeTypeName(typeStr: string, record: JsonRecord): string {
+  const lower = typeStr.toLowerCase();
+  if (lower === "float" || lower === "double") return "number";
+  if (
+    lower === "int" ||
+    lower === "int32" ||
+    lower === "int64" ||
+    lower === "uint" ||
+    lower === "uint32" ||
+    lower === "uint64"
+  ) {
+    return "integer";
+  }
+  if (lower === "bool") return "boolean";
+  if (lower === "dict" || lower === "map") return "object";
+  if (lower === "list" || lower === "set") return "array";
+  if (VALID_PROTOBUF_TYPES.has(lower)) return lower;
+  if (record.properties !== undefined) return "object";
+  if (record.items !== undefined) return "array";
+  return "string";
+}
+
+// Sanitize protobuf schema types recursively (ensures lowercase valid enum types)
+function sanitizeProtobufTypes(obj: unknown): void {
+  if (!obj || typeof obj !== "object") return;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      sanitizeProtobufTypes(item);
+    }
+    return;
+  }
+
+  const record = obj as JsonRecord;
+  if (typeof record.type === "string") {
+    record.type = sanitizeTypeName(record.type, record);
+  }
+
+  walkSchemaChildren(record, sanitizeProtobufTypes);
+}
+
+function injectObjectType(obj: unknown): void {
+  if (!obj || typeof obj !== "object") return;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      injectObjectType(item);
+    }
+    return;
+  }
+
+  const record = obj as JsonRecord;
+  if (!record.type && (record.properties !== undefined || Array.isArray(record.required))) {
+    record.type = "object";
+  }
+
+  walkSchemaChildren(record, injectObjectType);
+}
+
+function filterValidRequired(record: JsonRecord, rawList: unknown[]): string[] | undefined {
+  const rawRequired = rawList.filter(
+    (field): field is string => typeof field === "string" && field.trim().length > 0
+  );
+  const deduplicated = Array.from(new Set(rawRequired));
+  if (record.properties && typeof record.properties === "object" && !Array.isArray(record.properties)) {
+    const properties = toRecord(record.properties);
+    const valid = deduplicated.filter((field) => Object.prototype.hasOwnProperty.call(properties, field));
+    return valid.length > 0 ? valid : undefined;
+  }
+  return deduplicated.length > 0 ? deduplicated : undefined;
+}
+
+function cleanupRequired(obj: unknown): void {
+  if (!obj || typeof obj !== "object") return;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      cleanupRequired(item);
+    }
+    return;
+  }
+
+  const record = obj as JsonRecord;
+  if (record.required && Array.isArray(record.required)) {
+    const cleanedRequired = filterValidRequired(record, record.required);
+    if (cleanedRequired) {
+      record.required = cleanedRequired;
+    } else {
+      delete record.required;
+    }
+  }
+
+  walkSchemaChildren(record, cleanupRequired);
+}
+
+function addPlaceholders(obj: unknown): void {
+  if (!obj || typeof obj !== "object") return;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      addPlaceholders(item);
+    }
+    return;
+  }
+
+  const record = obj as JsonRecord;
+  if (record.type === "object") {
+    if (
+      !record.properties ||
+      typeof record.properties !== "object" ||
+      Array.isArray(record.properties) ||
+      Object.keys(toRecord(record.properties)).length === 0
+    ) {
+      record.properties = {
+        reason: {
+          type: "string",
+          description: "Brief explanation of why you are calling this tool",
+        },
+      };
+      record.required = ["reason"];
+    }
+  }
+
+  walkSchemaChildren(record, addPlaceholders);
+}
+
+function ensureArrayItems(obj: unknown): void {
+  if (!obj || typeof obj !== "object") return;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      ensureArrayItems(item);
+    }
+    return;
+  }
+
+  const record = obj as JsonRecord;
+  if (record.type === "array" && !record.items) {
+    record.items = { type: "string" };
+  }
+
+  walkSchemaChildren(record, ensureArrayItems);
 }
 
 // Clean JSON Schema for Antigravity API compatibility - removes unsupported keywords recursively
 // Reference: CLIProxyAPI/internal/util/gemini_schema.go
-/**
- * JSON Schema spells a nullable field as a union — `type: ["string","null"]`,
- * or an anyOf/oneOf with a `{"type":"null"}` branch. Gemini's Schema proto has
- * no unions and spells it as a sibling key, `nullable: true`. Record that
- * before Phase 2 flattens the union and destroys the evidence (#12308).
- *
- * Response schemas only (opt-in below). For a tool parameter, flattening to a
- * concrete type is correct — Gemini wants one, and the caller decides what an
- * absent argument means. For a response schema the union is the only thing
- * telling the model that "nothing" is a legal answer; without it a model with
- * nothing to say returns the string "null" or fabricates a value, and either
- * reaches the client as schema-conformant data.
- *
- * `nullable` survives the rest of the pipeline for free: it is absent from
- * GEMINI_UNSUPPORTED_SCHEMA_KEYS, and flattenAnyOfOneOf merges the surviving
- * branch with Object.assign, which cannot clobber a key the branch lacks.
- */
-function preserveNullable(obj: unknown): void {
-  if (!obj || typeof obj !== "object") return;
-
-  const record = obj as JsonRecord;
-  const hasNullBranch = (list: unknown): boolean =>
-    Array.isArray(list) && list.some((s) => s && toRecord(s).type === "null");
-
-  if (
-    (Array.isArray(record.type) && record.type.includes("null")) ||
-    hasNullBranch(record.anyOf) ||
-    hasNullBranch(record.oneOf)
-  ) {
-    record.nullable = true;
-  }
-
-  for (const value of Object.values(record)) {
-    if (value && typeof value === "object") {
-      preserveNullable(value);
-    }
-  }
-}
-
-export function cleanJSONSchemaForAntigravity(
-  schema: unknown,
-  options: { preserveNullable?: boolean } = {}
-): unknown {
+export function cleanJSONSchemaForAntigravity(schema: unknown): unknown {
   if (!schema || typeof schema !== "object") return schema;
 
   const root = cloneSchemaValue(schema);
-  let cleaned = inlineLocalSchemaRefs(root, root);
+  const cleaned = inlineLocalSchemaRefs(root, root);
 
   // Phase 0: #12269 malformed skill/tool schemas (boolean required, bare maps).
   normalizeMalformedSchemaObjects(cleaned);
@@ -810,14 +890,11 @@ export function cleanJSONSchemaForAntigravity(
   convertConstToEnum(cleaned);
   convertEnumValuesToStrings(cleaned);
 
-  // Phase 1b: response schemas only — record nullability while the union
-  // still exists; afterwards there is nothing left to detect (#12308).
-  if (options.preserveNullable) preserveNullable(cleaned);
-
   // Phase 2: Flatten complex structures
   mergeAllOf(cleaned);
   flattenAnyOfOneOf(cleaned);
   flattenTypeArrays(cleaned);
+  sanitizeProtobufTypes(cleaned);
 
   // Phase 3: Preserve the only supported additionalProperties shape before keyword cleanup.
   normalizeAdditionalProperties(cleaned);
@@ -825,111 +902,16 @@ export function cleanJSONSchemaForAntigravity(
   // Phase 4: Remove all unsupported keywords at ALL levels (including inside arrays).
   removeUnsupportedKeywords(cleaned, GEMINI_UNSUPPORTED_SCHEMA_KEYS);
 
-  // Phase 5: Cleanup required fields recursively.
-  function cleanupRequired(obj: unknown): void {
-    if (!obj || typeof obj !== "object") return;
-
-    if (Array.isArray(obj)) {
-      for (const item of obj) {
-        cleanupRequired(item);
-      }
-      return;
-    }
-
-    const record = obj as JsonRecord;
-    if (record.required && Array.isArray(record.required) && record.properties) {
-      const properties = toRecord(record.properties);
-      const validRequired = record.required.filter(
-        (field) =>
-          typeof field === "string" && Object.prototype.hasOwnProperty.call(properties, field)
-      );
-      if (validRequired.length === 0) {
-        delete record.required;
-      } else {
-        record.required = validRequired;
-      }
-    }
-
-    forEachSubschema(record, cleanupRequired);
-  }
-
-  cleanupRequired(cleaned);
-
-  // Phase 6: Add placeholder for empty object schemas (Antigravity requirement).
-  function addPlaceholders(obj: unknown): void {
-    if (!obj || typeof obj !== "object") return;
-
-    if (Array.isArray(obj)) {
-      for (const item of obj) {
-        addPlaceholders(item);
-      }
-      return;
-    }
-
-    const record = obj as JsonRecord;
-    if (record.type === "object") {
-      if (!record.properties || Object.keys(toRecord(record.properties)).length === 0) {
-        record.properties = {
-          reason: {
-            type: "string",
-            description: "Brief explanation of why you are calling this tool",
-          },
-        };
-        record.required = ["reason"];
-      }
-    }
-
-    forEachSubschema(record, addPlaceholders);
-  }
-
-  addPlaceholders(cleaned);
-
-  // Phase 7: Recursive type:"object" injection for nested schemas (#9268).
-  // Gemini/Vertex requires every node with properties/required to have an explicit
-  // `type: "object"`. Some clients (e.g. Composio-exported tools) emit nested
-  // schemas with `properties` but no `type`, causing a Gemini 400. Follow the
-  // `removeUnsupportedKeywords()`/`addPlaceholders()` visitor pattern.
-  function injectObjectType(obj: unknown): void {
-    if (!obj || typeof obj !== "object") return;
-
-    if (Array.isArray(obj)) {
-      for (const item of obj) {
-        injectObjectType(item);
-      }
-      return;
-    }
-
-    const record = obj as JsonRecord;
-    if (!record.type && (record.properties !== undefined || record.required !== undefined)) {
-      record.type = "object";
-    }
-
-    forEachSubschema(record, injectObjectType);
-  }
-
+  // Phase 5: Recursive type:"object" injection for nested schemas (#9268).
   injectObjectType(cleaned);
 
+  // Phase 6: Cleanup and deduplicate required fields recursively.
+  cleanupRequired(cleaned);
+
+  // Phase 7: Add placeholder for empty object schemas (Antigravity requirement).
+  addPlaceholders(cleaned);
+
   // Phase 8: Ensure array types have an items schema (#10578).
-  // Gemini strictly requires array parameters to define their `items` schema.
-  // If an MCP tool defines an array but forgets the items, inject a safe default.
-  function ensureArrayItems(obj: unknown): void {
-    if (!obj || typeof obj !== "object") return;
-
-    if (Array.isArray(obj)) {
-      for (const item of obj) {
-        ensureArrayItems(item);
-      }
-      return;
-    }
-
-    const record = obj as JsonRecord;
-    if (record.type === "array" && !record.items) {
-      record.items = { type: "string" };
-    }
-
-    forEachSubschema(record, ensureArrayItems);
-  }
-
   ensureArrayItems(cleaned);
 
   return cleaned;

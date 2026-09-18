@@ -131,6 +131,101 @@ test("cleanJSONSchemaForAntigravity handles nested schema", () => {
   assert.ok(typeof result === "object");
 });
 
+test("cleanJSONSchemaForAntigravity preserves property named 'required' without corrupting properties map", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      target: { type: "string" },
+      required: { type: "boolean", description: "Whether pinning is required" },
+    },
+    required: ["target"],
+  };
+  const result = gemini.cleanJSONSchemaForAntigravity(schema) as Record<string, unknown>;
+  assert.equal(result.type, "object");
+  assert.deepEqual(result.required, ["target"]);
+
+  const properties = result.properties as Record<string, unknown>;
+  assert.equal("type" in properties, false, "properties map must not have type:object injected");
+  assert.equal("reason" in properties, false, "properties map must not have dummy reason injected");
+  assert.deepEqual(Object.keys(properties).sort(), ["required", "target"]);
+  assert.deepEqual(properties.required, {
+    type: "boolean",
+    description: "Whether pinning is required",
+  });
+});
+
+test("cleanJSONSchemaForAntigravity handles deep nested properties with 'required' property key (OpenClaw message.delivery.pin.required)", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      message: {
+        type: "object",
+        properties: {
+          delivery: {
+            type: "object",
+            properties: {
+              pin: {
+                type: "object",
+                properties: {
+                  required: {
+                    type: "boolean",
+                    description: "Pin delivery required flag",
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+  const result = gemini.cleanJSONSchemaForAntigravity(schema) as Record<string, unknown>;
+  const msgProps = result.properties as Record<string, Record<string, unknown>>;
+  const delivProps = msgProps.message.properties as Record<string, Record<string, unknown>>;
+  const pinProps = delivProps.delivery.properties as Record<string, Record<string, unknown>>;
+  const leafProps = pinProps.pin.properties as Record<string, Record<string, unknown>>;
+
+  assert.equal("type" in leafProps, false, "leaf properties map must not be treated as a schema node");
+  assert.equal("reason" in leafProps, false, "leaf properties map must not have placeholder reason injected");
+  assert.deepEqual(Object.keys(leafProps), ["required"]);
+  assert.deepEqual(leafProps.required, {
+    type: "boolean",
+    description: "Pin delivery required flag",
+  });
+});
+
+test("cleanJSONSchemaForAntigravity deduplicates required array entries", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      query: { type: "string" },
+    },
+    required: ["query", "query", "query"],
+  };
+  const result = gemini.cleanJSONSchemaForAntigravity(schema) as Record<string, unknown>;
+  assert.deepEqual(result.required, ["query"]);
+});
+
+test("cleanJSONSchemaForAntigravity normalizes protobuf types (dict, bool, int, float, list)", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      a: { type: "dict", properties: { key: { type: "string" } } },
+      b: { type: "bool" },
+      c: { type: "int32" },
+      d: { type: "float" },
+      e: { type: "list", items: { type: "string" } },
+    },
+  };
+  const result = gemini.cleanJSONSchemaForAntigravity(schema) as Record<string, unknown>;
+  const props = result.properties as Record<string, Record<string, unknown>>;
+  assert.equal(props.a.type, "object");
+  assert.equal(props.b.type, "boolean");
+  assert.equal(props.c.type, "integer");
+  assert.equal(props.d.type, "number");
+  assert.equal(props.e.type, "array");
+});
+
 test("convertOpenAIContentToParts maps OpenAI Chat Completions file (PDF) to inlineData", () => {
   const content = [
     { type: "text", text: "read this" },
