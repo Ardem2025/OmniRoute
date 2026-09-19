@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { cleanJSONSchemaForAntigravity } from "../../open-sse/translator/helpers/geminiHelper.ts";
+import { cleanJSONSchemaForAntigravity } from "../../open-sse/translator/helpers/geminiHelper";
 
 type SchemaNode = {
   type?: string;

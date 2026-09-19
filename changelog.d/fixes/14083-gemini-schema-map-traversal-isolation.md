@@ -1,1 +1,1 @@
-- **fix(gemini):** isolate schema map traversal to prevent injecting fictitious properties into property maps and schema maps during Antigravity normalization (#14083) — thanks @Ardem2025
+- **fix(gemini):** normalize protobuf-flavored schema type spellings (`dict`, `bool`, `int32`, `float`, `list`, ...) to valid Gemini/Antigravity types and deduplicate repeated `required` array entries during tool-schema sanitization (#14083) — thanks @Ardem2025
