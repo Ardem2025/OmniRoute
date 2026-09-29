@@ -3,15 +3,34 @@ import test from "node:test";
 
 import { executeImageWithCredentialFallback } from "../../src/sse/services/imageCredentialRetry.ts";
 
-test("executeImageWithCredentialFallback rotates to sibling account when account returns HTTP 429", async () => {
-  const account1 = { connectionId: "conn-antigravity-1", accessToken: "token-1" };
-  const account2 = { connectionId: "conn-antigravity-2", accessToken: "token-2" };
+interface MockImageCredentials {
+  connectionId: string;
+  accessToken: string;
+}
+
+interface MockImageResult {
+  success: boolean;
+  status: number;
+  error?: unknown;
+  data?: unknown;
+  retryable?: boolean;
+}
+
+test("executeImageWithCredentialFallback rotates to sibling account on Antigravity's quota-exhausted 429 (#14112)", async () => {
+  const account1: MockImageCredentials = {
+    connectionId: "conn-antigravity-1",
+    accessToken: "token-1",
+  };
+  const account2: MockImageCredentials = {
+    connectionId: "conn-antigravity-2",
+    accessToken: "token-2",
+  };
 
   const executedAccounts: string[] = [];
 
   const mockSelectNextCredentials = async (
-    provider: string,
-    requestedModel: string | null,
+    _provider: string,
+    _requestedModel: string | null,
     excludedConnectionIds: Set<string>
   ) => {
     if (!excludedConnectionIds.has(account2.connectionId)) {
@@ -20,13 +39,19 @@ test("executeImageWithCredentialFallback rotates to sibling account when account
     return { allRateLimited: true, retryAfter: 60 };
   };
 
-  const mockExecute = async (creds: any) => {
+  const mockExecute = async (creds: MockImageCredentials): Promise<MockImageResult> => {
     executedAccounts.push(creds.connectionId);
     if (creds.connectionId === "conn-antigravity-1") {
+      // Antigravity's explicit exhausted-quota wording — the one 429 signal
+      // isAntigravityImageQuotaExhausted() treats as safe to rotate on.
       return {
         success: false,
         status: 429,
-        error: "RESOURCE_EXHAUSTED: Rate limit exceeded",
+        error: {
+          error: {
+            message: "Individual quota reached. Contact your administrator to enable overages.",
+          },
+        },
       };
     }
     return {
@@ -53,15 +78,21 @@ test("executeImageWithCredentialFallback rotates to sibling account when account
   assert.equal(credentials.connectionId, "conn-antigravity-2");
 });
 
-test("executeImageWithCredentialFallback terminates when all accounts return HTTP 429", async () => {
-  const account1 = { connectionId: "conn-antigravity-1", accessToken: "token-1" };
-  const account2 = { connectionId: "conn-antigravity-2", accessToken: "token-2" };
+test("executeImageWithCredentialFallback terminates when all accounts return Antigravity's quota-exhausted 429 (#14112)", async () => {
+  const account1: MockImageCredentials = {
+    connectionId: "conn-antigravity-1",
+    accessToken: "token-1",
+  };
+  const account2: MockImageCredentials = {
+    connectionId: "conn-antigravity-2",
+    accessToken: "token-2",
+  };
 
   const executedAccounts: string[] = [];
 
   const mockSelectNextCredentials = async (
-    provider: string,
-    requestedModel: string | null,
+    _provider: string,
+    _requestedModel: string | null,
     excludedConnectionIds: Set<string>
   ) => {
     if (!excludedConnectionIds.has(account2.connectionId)) {
@@ -70,16 +101,20 @@ test("executeImageWithCredentialFallback terminates when all accounts return HTT
     return { allRateLimited: true, retryAfter: 60 };
   };
 
-  const mockExecute = async (creds: any) => {
+  const mockExecute = async (creds: MockImageCredentials): Promise<MockImageResult> => {
     executedAccounts.push(creds.connectionId);
     return {
       success: false,
       status: 429,
-      error: "RESOURCE_EXHAUSTED: Quota exceeded",
+      error: {
+        error: {
+          message: "Individual quota reached. Contact your administrator to enable overages.",
+        },
+      },
     };
   };
 
-  const { credentials, result } = await executeImageWithCredentialFallback({
+  const { result } = await executeImageWithCredentialFallback({
     provider: "antigravity",
     requestedModel: "gemini-3.1-flash-image",
     credentials: account1,
@@ -92,15 +127,57 @@ test("executeImageWithCredentialFallback terminates when all accounts return HTT
   assert.deepEqual(executedAccounts, ["conn-antigravity-1", "conn-antigravity-2"]);
 });
 
-test("executeImageWithCredentialFallback handles 401 and retryable flags correctly", async () => {
-  const account1 = { connectionId: "conn-1", accessToken: "token-1" };
-  const account2 = { connectionId: "conn-2", accessToken: "token-2" };
+test("executeImageWithCredentialFallback does not rotate on an ordinary (non-quota-exhausted) 429 (#14112)", async () => {
+  const account1: MockImageCredentials = {
+    connectionId: "conn-antigravity-1",
+    accessToken: "token-1",
+  };
+  const account2: MockImageCredentials = {
+    connectionId: "conn-antigravity-2",
+    accessToken: "token-2",
+  };
 
   const executedAccounts: string[] = [];
 
   const mockSelectNextCredentials = async (
-    provider: string,
-    requestedModel: string | null,
+    _provider: string,
+    _requestedModel: string | null,
+    _excludedConnectionIds: Set<string>
+  ) => account2;
+
+  const mockExecute = async (creds: MockImageCredentials): Promise<MockImageResult> => {
+    executedAccounts.push(creds.connectionId);
+    // Image generation is non-idempotent: an ordinary rate-limit 429 (no
+    // quota-exhausted evidence) must NOT trigger account rotation.
+    return {
+      success: false,
+      status: 429,
+      error: { error: { message: "RESOURCE_EXHAUSTED: too many requests; retry later" } },
+    };
+  };
+
+  const { result } = await executeImageWithCredentialFallback({
+    provider: "antigravity",
+    requestedModel: "gemini-3.1-flash-image",
+    credentials: account1,
+    execute: mockExecute,
+    selectNextCredentials: mockSelectNextCredentials,
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.status, 429);
+  assert.deepEqual(executedAccounts, ["conn-antigravity-1"]);
+});
+
+test("executeImageWithCredentialFallback handles 401 and retryable flags correctly", async () => {
+  const account1: MockImageCredentials = { connectionId: "conn-1", accessToken: "token-1" };
+  const account2: MockImageCredentials = { connectionId: "conn-2", accessToken: "token-2" };
+
+  const executedAccounts: string[] = [];
+
+  const mockSelectNextCredentials = async (
+    _provider: string,
+    _requestedModel: string | null,
     excludedConnectionIds: Set<string>
   ) => {
     if (!excludedConnectionIds.has(account2.connectionId)) {
@@ -114,7 +191,7 @@ test("executeImageWithCredentialFallback handles 401 and retryable flags correct
     provider: "codex",
     requestedModel: "gpt-5.6-sol",
     credentials: account1,
-    execute: async (creds: any) => {
+    execute: async (creds: MockImageCredentials): Promise<MockImageResult> => {
       executedAccounts.push(creds.connectionId);
       if (creds.connectionId === "conn-1") {
         return { success: false, status: 401, error: "Unauthorized" };
@@ -133,7 +210,7 @@ test("executeImageWithCredentialFallback handles 401 and retryable flags correct
     provider: "codex",
     requestedModel: "gpt-5.6-sol",
     credentials: account1,
-    execute: async (creds: any) => {
+    execute: async (creds: MockImageCredentials): Promise<MockImageResult> => {
       executedAccounts.push(creds.connectionId);
       return { success: false, status: 400, error: "Invalid prompt format" };
     },
@@ -150,10 +227,15 @@ test("executeImageWithCredentialFallback handles 401 and retryable flags correct
     provider: "codex",
     requestedModel: "gpt-5.6-sol",
     credentials: account1,
-    execute: async (creds: any) => {
+    execute: async (creds: MockImageCredentials): Promise<MockImageResult> => {
       executedAccounts.push(creds.connectionId);
       if (creds.connectionId === "conn-1") {
-        return { success: false, status: 400, retryable: true, error: "Model not supported on this account" };
+        return {
+          success: false,
+          status: 400,
+          retryable: true,
+          error: "Model not supported on this account",
+        };
       }
       return { success: true, status: 200, data: { ok: true } };
     },
