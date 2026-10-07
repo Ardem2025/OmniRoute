@@ -1053,6 +1053,31 @@ async function handleKieImageGeneration({
  * Handle Gemini-format image generation (Antigravity / Nano Banana)
  * Uses Gemini's generateContent API with responseModalities: ["TEXT", "IMAGE"]
  */
+function geminiInlineImagePart(
+  body: unknown
+): { inlineData: { mimeType: string; data: string } } | null {
+  if (!body || typeof body !== "object") return null;
+  const record = body as Record<string, unknown>;
+  const mimeType =
+    typeof record.imageMime === "string" && record.imageMime ? record.imageMime : "image/png";
+  if (Buffer.isBuffer(record.imageBytes)) {
+    return { inlineData: { mimeType, data: record.imageBytes.toString("base64") } };
+  }
+  if (typeof record.imageBytes === "string" && record.imageBytes.length > 0) {
+    return { inlineData: { mimeType, data: record.imageBytes } };
+  }
+  if (typeof record.image_url === "string" && record.image_url.startsWith("data:")) {
+    return {
+      inlineData: {
+        mimeType:
+          record.image_url.match(/^data:(image\/[a-zA-Z0-9+-]+);base64,/)?.[1] || "image/png",
+        data: record.image_url.replace(/^data:image\/[a-zA-Z0-9+-]+;base64,/, ""),
+      },
+    };
+  }
+  return null;
+}
+
 async function handleGeminiImageGeneration({ model, providerConfig, body, credentials, log }) {
   const startTime = Date.now();
   const url = providerConfig.baseUrl;
@@ -1108,6 +1133,7 @@ async function handleGeminiImageGeneration({ model, providerConfig, body, creden
     });
   }
 
+  const inlineImage = geminiInlineImagePart(body);
   const antigravityBody = {
     project: projectId,
     requestId: `image_gen/${Date.now()}/${randomUUID()}/0`,
@@ -1115,38 +1141,7 @@ async function handleGeminiImageGeneration({ model, providerConfig, body, creden
       contents: [
         {
           role: "user",
-          parts: [
-            ...((body as any).imageBytes
-              ? [
-                  {
-                    inlineData: {
-                      mimeType:
-                        (typeof (body as any).imageMime === "string" && (body as any).imageMime) ||
-                        "image/png",
-                      data: Buffer.isBuffer((body as any).imageBytes)
-                        ? (body as any).imageBytes.toString("base64")
-                        : String((body as any).imageBytes),
-                    },
-                  },
-                ]
-              : typeof (body as any).image_url === "string" &&
-                (body as any).image_url.startsWith("data:")
-              ? [
-                  {
-                    inlineData: {
-                      mimeType:
-                        (body as any).image_url.match(/^data:(image\/[a-zA-Z0-9+-]+);base64,/)?.[1] ||
-                        "image/png",
-                      data: (body as any).image_url.replace(
-                        /^data:image\/[a-zA-Z0-9+-]+;base64,/,
-                        ""
-                      ),
-                    },
-                  },
-                ]
-              : []),
-            { text: promptText },
-          ],
+          parts: [...(inlineImage ? [inlineImage] : []), { text: promptText }],
         },
       ],
       generationConfig: {

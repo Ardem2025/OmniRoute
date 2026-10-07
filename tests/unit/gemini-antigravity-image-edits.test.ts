@@ -21,9 +21,26 @@ process.on("exit", () => {
 
 const { handleImageGeneration } = await import("../../open-sse/handlers/imageGeneration.ts");
 
+interface CapturedGeminiImageRequest {
+  url: string;
+  headers?: HeadersInit;
+  body: {
+    model?: string;
+    project?: string;
+    request?: {
+      contents?: Array<{
+        parts?: Array<{
+          text?: string;
+          inlineData?: { mimeType?: string; data?: string };
+        }>;
+      }>;
+    };
+  };
+}
+
 test("handleImageGeneration forwards inlineData parts for Antigravity Gemini image edits with Buffer", async () => {
   const originalFetch = globalThis.fetch;
-  let captured: any;
+  let captured: CapturedGeminiImageRequest | undefined;
 
   globalThis.fetch = async (url, options = {}) => {
     captured = {
@@ -83,7 +100,7 @@ test("handleImageGeneration forwards inlineData parts for Antigravity Gemini ima
 
 test("handleImageGeneration forwards inlineData parts for Antigravity Gemini image edits with data URI", async () => {
   const originalFetch = globalThis.fetch;
-  let captured: any;
+  let captured: CapturedGeminiImageRequest | undefined;
 
   globalThis.fetch = async (url, options = {}) => {
     captured = {
